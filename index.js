@@ -12,7 +12,7 @@ app.use(express.json());
 var upload = multer({ dest: 'uploads/' });
 
 var openai = new OpenAI({
-  apiKey: 'process.env.OPENAI_API_KEY',
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 // OCR Endpoint - extracts reviewer metadata and detects suggestions
