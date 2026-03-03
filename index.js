@@ -15,7 +15,68 @@ var openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// OCR Endpoint - extracts reviewer metadata and detects suggestions
+// NEW: Text-based Review Analysis Endpoint (used with on-device Apple Vision OCR)
+// Receives plain text extracted on-device and uses GPT-4o-mini (much cheaper than sending images to GPT-4o)
+app.post('/analyze-review', async function(req, res) {
+  console.log('[Analyze] Request received');
+  try {
+    var text = req.body.text;
+
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: 'No text provided' });
+    }
+
+    var completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: 'You analyze customer review text extracted via OCR from review platform screenshots (Google, Yelp, TripAdvisor). The text may include UI elements, reviewer info, and the actual review. Your job is to parse all of it. Respond with ONLY a JSON object, no other text.',
+        },
+        {
+          role: 'user',
+          content: 'Analyze this OCR-extracted text from a review screenshot. Respond with ONLY this JSON format:\n\n{"cleanedText": "just the actual review text, stripped of UI elements and metadata", "sentiment": "positive" or "negative" or "mixed", "reviewerName": "reviewer name if found, or null", "reviewerBadge": "badge like Elite 24 or Local Guide if found, or null", "photoCount": number of photos if mentioned or null, "checkInCount": number of check-ins if mentioned or null, "platform": "Google" or "Yelp" or "TripAdvisor" or null, "suggestions": ["array of specific improvement suggestions mentioned in the review, like faster service or better parking"]}\n\nOCR text:\n' + text,
+        },
+      ],
+      max_tokens: 500,
+    });
+
+    var rawResponse = completion.choices[0].message.content;
+    console.log('[Analyze] Response received');
+
+    try {
+      var cleaned = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      var parsed = JSON.parse(cleaned);
+      res.json({
+        cleanedText: parsed.cleanedText || text,
+        sentiment: parsed.sentiment || 'mixed',
+        reviewerName: parsed.reviewerName || null,
+        reviewerBadge: parsed.reviewerBadge || null,
+        photoCount: parsed.photoCount || null,
+        checkInCount: parsed.checkInCount || null,
+        platform: parsed.platform || null,
+        suggestions: parsed.suggestions || [],
+      });
+    } catch (parseError) {
+      console.warn('[Analyze] JSON parse failed, returning defaults');
+      res.json({
+        cleanedText: text,
+        sentiment: 'mixed',
+        reviewerName: null,
+        reviewerBadge: null,
+        photoCount: null,
+        checkInCount: null,
+        platform: null,
+        suggestions: [],
+      });
+    }
+  } catch (error) {
+    console.error('[Analyze] Error:', error.message);
+    res.status(500).json({ error: 'Review analysis failed' });
+  }
+});
+
+// LEGACY: OCR Endpoint (kept as fallback - sends image to GPT-4o)
 app.post('/ocr', upload.single('image'), async function(req, res) {
   try {
     var imagePath = req.file.path;
