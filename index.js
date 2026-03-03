@@ -135,7 +135,7 @@ function ensureContactAndSignature(response, isNegative, hasContact, contactMeth
       }
     }
 
-    if (sigStart !== -1) {
+    if (sigStart !== -1 && sigStart >= 2) {
       text = lines.slice(0, sigStart).join('\n').trimEnd();
     }
 
