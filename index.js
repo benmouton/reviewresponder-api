@@ -4,15 +4,99 @@ var OpenAI = require('openai');
 var multer = require('multer');
 var fs = require('fs');
 var path = require('path');
+var { Pool } = require('pg');
+var rateLimit = require('express-rate-limit');
 
 var app = express();
 app.use(cors());
 app.use(express.json());
 
+// Rate limiting: 30 requests per minute per IP for generation endpoints
+var generateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again in a minute.' },
+});
+app.use('/generate', generateLimiter);
+app.use('/ocr', generateLimiter);
+app.use('/analyze-review', generateLimiter);
+
 var upload = multer({ dest: 'uploads/' });
 
 var openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+});
+
+// ── Server-side Generation Counter (Postgres) ───────────────
+var pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+});
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS generations (
+      device_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (device_id, month)
+    )
+  `);
+  console.log('[DB] Generations table ready');
+}
+
+initDatabase().catch(function(err) {
+  console.error('[DB] Failed to initialize:', err.message);
+});
+
+var FREE_GENERATION_LIMIT = 15;
+
+function getCurrentMonth() {
+  var now = new Date();
+  return now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+}
+
+async function getGenerationCount(deviceId) {
+  var month = getCurrentMonth();
+  var result = await pool.query(
+    'SELECT count FROM generations WHERE device_id = $1 AND month = $2',
+    [deviceId, month]
+  );
+  return result.rows.length > 0 ? result.rows[0].count : 0;
+}
+
+async function incrementGeneration(deviceId) {
+  var month = getCurrentMonth();
+  await pool.query(`
+    INSERT INTO generations (device_id, month, count) VALUES ($1, $2, 1)
+    ON CONFLICT (device_id, month) DO UPDATE SET count = generations.count + 1
+  `, [deviceId, month]);
+  return await getGenerationCount(deviceId);
+}
+
+// ── Check generation limit endpoint ─────────────────────────
+app.post('/check-limit', async function(req, res) {
+  var deviceId = req.body.deviceId;
+  var isPro = req.body.isPro || false;
+
+  if (!deviceId) {
+    return res.status(400).json({ error: 'deviceId is required' });
+  }
+
+  try {
+    var count = await getGenerationCount(deviceId);
+    res.json({
+      count: count,
+      limit: FREE_GENERATION_LIMIT,
+      remaining: isPro ? 999999 : Math.max(0, FREE_GENERATION_LIMIT - count),
+      isAtLimit: !isPro && count >= FREE_GENERATION_LIMIT,
+    });
+  } catch (err) {
+    console.error('[check-limit] Error:', err.message);
+    res.status(500).json({ error: 'Failed to check limit' });
+  }
 });
 
 // NEW: Text-based Review Analysis Endpoint (used with on-device Apple Vision OCR)
@@ -282,6 +366,30 @@ function getToneInstructions(tone, isPositive) {
 app.post('/generate', async function(req, res) {
   try {
     var body = req.body;
+    var deviceId = body.deviceId;
+    var isPro = body.isPro || false;
+
+    // Input validation
+    var reviewText = body.reviewText;
+    if (!reviewText || typeof reviewText !== 'string' || reviewText.trim().length === 0) {
+      return res.status(400).json({ error: 'reviewText is required' });
+    }
+    if (reviewText.length > 5000) {
+      return res.status(400).json({ error: 'reviewText exceeds maximum length of 5000 characters' });
+    }
+
+    // Server-side generation limit enforcement
+    if (deviceId && !isPro) {
+      var currentCount = await getGenerationCount(deviceId);
+      if (currentCount >= FREE_GENERATION_LIMIT) {
+        return res.status(403).json({
+          error: 'Generation limit reached',
+          count: currentCount,
+          limit: FREE_GENERATION_LIMIT,
+        });
+      }
+    }
+
     var businessType = body.businessType;
     var reviewType = body.reviewType;
     var tone = body.tone;
@@ -290,7 +398,6 @@ app.post('/generate', async function(req, res) {
     var yourTitle = body.yourTitle;
     var contactMethod = body.contactMethod;
     var contactInfo = body.contactInfo;
-    var reviewText = body.reviewText;
     var reviewerName = body.reviewerName || null;
     var reviewerBadge = body.reviewerBadge || null;
     var photoCount = body.photoCount || null;
@@ -308,7 +415,10 @@ app.post('/generate', async function(req, res) {
     var toneInstructions = getToneInstructions(tone, isPositive || isMixed);
 
     // Build base prompt
-    var basePrompt = 'You are a ' + businessType + ' owner who personally responds to online reviews. Write a response to this ' + reviewType.toLowerCase() + '.\n\n';
+    var basePrompt = 'You are an AI Review Response Agent for a ' + businessType + '. You generate professional public responses to online customer reviews (Google, Yelp, Facebook, TripAdvisor, etc.).\n';
+    basePrompt += 'Your responses should help maintain the business\'s reputation, show appreciation to customers, and demonstrate professionalism.\n\n';
+
+    basePrompt += 'Write a response to this ' + reviewType.toLowerCase() + ' review.\n\n';
 
     if (businessName) basePrompt += 'Your restaurant/business is called ' + businessName + '.\n';
     if (yourName) basePrompt += 'Your name is ' + yourName + '.\n';
@@ -320,15 +430,32 @@ app.post('/generate', async function(req, res) {
 
     basePrompt += '\nThe customer wrote:\n"' + reviewText + '"\n\n';
 
-    basePrompt += 'Guidelines:\n';
-    basePrompt += '- Tone instructions: ' + toneInstructions + '\n';
-    basePrompt += '- Sound like a real person, not a corporate template\n';
-    basePrompt += '- Reference specific things the customer mentioned\n';
-    basePrompt += '- Do NOT start with "Dear Customer" -- address them naturally or skip a greeting\n';
-    basePrompt += '- Do NOT use phrases like "We value all our customers" or "Your feedback is important to us"\n';
+    // Tone guidelines
+    basePrompt += 'Tone Guidelines:\n';
+    basePrompt += '- ' + toneInstructions + '\n';
+    basePrompt += '- Always be: warm, friendly, professional, calm, appreciative\n';
+    basePrompt += '- Never sound: defensive, argumentative, robotic, corporate/legalistic, or condescending\n';
+    basePrompt += '- Write like a thoughtful manager responding personally\n\n';
 
-    if (isPositive || isMixed) {
-      basePrompt += '- Be warm and genuine, mention what they enjoyed specifically\n';
+    // Style rules
+    basePrompt += 'Style Rules:\n';
+    basePrompt += '- Do NOT repeat menu items, products, or specific dishes mentioned in the review\n';
+    basePrompt += '- Keep responses concise -- target 35-80 words, never exceed 120 words (excluding sign-off)\n';
+    basePrompt += '- Do NOT start with "Dear Customer" -- address them naturally or skip a greeting\n';
+    basePrompt += '- Do NOT use generic filler phrases like "We strive for excellence", "Your satisfaction is our top priority", "We value all our customers", or "Your feedback is important to us"\n';
+    basePrompt += '- Write naturally, like a human\n';
+    basePrompt += '- Do not apologize excessively\n';
+    basePrompt += '- Do not admit legal fault or liability\n';
+    basePrompt += '- Never blame the guest\n';
+    basePrompt += '- Never mention photos, images, or visual content unless the review text itself explicitly references photos or images. Do not infer or assume photos exist based on reviewer badges or platform metadata.\n';
+    basePrompt += '- Response must be ready to copy-paste as a public reply -- return ONLY the response text, no analysis, explanation, or headings\n\n';
+
+    // Rating-based strategy
+    if (isPositive) {
+      basePrompt += 'Response Strategy (positive review):\n';
+      basePrompt += '- Goal: Reinforce goodwill\n';
+      basePrompt += '- Include: gratitude for the visit, appreciation for the kind words, a welcoming closing line\n';
+      basePrompt += '- Structure: Thank → Appreciate → Welcome back\n';
 
       if (reviewerName) {
         basePrompt += '- Address the reviewer by their first name naturally\n';
@@ -347,23 +474,58 @@ app.post('/generate', async function(req, res) {
       }
     }
 
+    if (isMixed) {
+      basePrompt += 'Response Strategy (mixed review):\n';
+      basePrompt += '- Goal: Show attentiveness and openness to improvement\n';
+      basePrompt += '- Include: thank them for the feedback, recognize mixed experience, encourage another visit\n';
+      basePrompt += '- Structure: Thank → Acknowledge → Improve → Invite back\n';
+
+      if (reviewerName) {
+        basePrompt += '- Address the reviewer by their first name naturally\n';
+      }
+      if (reviewerBadge) {
+        basePrompt += '- Acknowledge their reviewer status naturally\n';
+      }
+      if (photoCount && photoCount > 0) {
+        basePrompt += '- Thank them for sharing photos\n';
+      }
+      if (checkInCount && checkInCount > 1) {
+        basePrompt += '- Acknowledge that they are a repeat visitor\n';
+      }
+      if (hasSuggestion) {
+        basePrompt += '- IMPORTANT: The reviewer included a suggestion or constructive feedback. Acknowledge it specifically and respond to it genuinely.\n';
+      }
+    }
+
     if (isNegative) {
-      basePrompt += '- Keep it concise (4-7 sentences)\n';
-      basePrompt += '- Acknowledge the issue specifically, take ownership, offer to make it right\n';
+      basePrompt += 'Response Strategy (negative review):\n';
+      basePrompt += '- Goal: Protect reputation and move conversation offline\n';
+      basePrompt += '- Include: calm acknowledgement, professional tone, invitation to contact management privately\n';
+      basePrompt += '- Structure: Acknowledge → Express concern → Invite contact\n';
+      basePrompt += '- Never: argue, accuse, or debate facts publicly\n';
       if (reviewerName) {
         basePrompt += '- Address the reviewer by their first name\n';
       }
     }
 
+    // Edge cases
+    basePrompt += '\nEdge Cases:\n';
+    basePrompt += '- If the review has no comment text, respond with a brief thank-you\n';
+    basePrompt += '- If the review contains extremely hostile language, remain calm and professional\n';
+    basePrompt += '- If the review contains false accusations, do not argue publicly -- offer to discuss offline\n';
+    basePrompt += '- If the review is about service complaints, show concern and willingness to improve\n';
+
     if (isNegative && hasContact) {
-      basePrompt += '- CRITICAL: The response MUST include "' + contactInfo + '" as the contact ' + contactMethod + '. Do NOT invent a different email/phone. Use ONLY "' + contactInfo + '".\n';
+      basePrompt += '\n- CRITICAL: The response MUST include "' + contactInfo + '" as the contact ' + contactMethod + '. Do NOT invent a different email/phone. Use ONLY "' + contactInfo + '".\n';
     }
 
     if (yourName) {
-      basePrompt += '- Sign off with EXACTLY this on the last lines (no "Best Regards", "Sincerely", "Warm Regards", etc.):\n' + signatureFormat + '\n';
+      basePrompt += '\n- Sign off with EXACTLY this on the last lines (no "Best Regards", "Sincerely", "Warm Regards", etc.):\n' + signatureFormat + '\n';
     } else {
-      basePrompt += '- Do not include a sign-off\n';
+      basePrompt += '\n- Do not include a sign-off\n';
     }
+
+    basePrompt += '\nCore Principle: The response should always make readers think: "This business is professional, attentive, and cares about its guests."\n';
 
     // Build variant prompts
     var variantPrompts = [];
@@ -400,7 +562,11 @@ app.post('/generate', async function(req, res) {
       var v5 = basePrompt;
       if (reviewerBadge || (photoCount && photoCount > 0) || (checkInCount && checkInCount > 1)) {
         v5 += '- LENGTH: 4-5 sentences.\n';
-        v5 += '\nWrite a response that especially celebrates this reviewer\'s engagement -- their photos, their repeat visits, or their active presence on the platform. Make them feel valued as a community member and part of the family, not just a customer.\nWrite this response now:';
+        var engagementAspects = [];
+        if (photoCount && photoCount > 0) engagementAspects.push('their photos');
+        if (checkInCount && checkInCount > 1) engagementAspects.push('their repeat visits');
+        if (reviewerBadge) engagementAspects.push('their active presence on the platform');
+        v5 += '\nWrite a response that especially celebrates this reviewer\'s engagement -- ' + engagementAspects.join(', ') + '. Make them feel valued as a community member and part of the family, not just a customer.\nWrite this response now:';
       } else {
         v5 += '- LENGTH: 4-5 sentences.\n';
         v5 += '\nWrite a response that highlights your business growth, your pride in what you have built, or how the community has supported you. If the reviewer mentioned expansion, growth, or that you are new, lean into that excitement. Make the reviewer feel like part of your journey.\nWrite this response now:';
@@ -416,7 +582,7 @@ app.post('/generate', async function(req, res) {
       ];
     }
 
-    var results = await Promise.all(
+    var results = await Promise.allSettled(
       variantPrompts.map(function(prompt) {
         return openai.chat.completions.create({
           model: 'gpt-4',
@@ -427,11 +593,20 @@ app.post('/generate', async function(req, res) {
       })
     );
 
-    var responses = results.map(function(result) {
-      var text = result.choices[0].message.content;
-      text = ensureContactAndSignature(text, isNegative, hasContact, contactMethod, contactInfo, yourName, yourTitle, businessName);
-      return text;
-    });
+    var responses = [];
+    for (var i = 0; i < results.length; i++) {
+      if (results[i].status === 'fulfilled') {
+        var text = results[i].value.choices[0].message.content;
+        text = ensureContactAndSignature(text, isNegative, hasContact, contactMethod, contactInfo, yourName, yourTitle, businessName);
+        responses.push(text);
+      } else {
+        console.error('[generate] Variant ' + i + ' failed:', results[i].reason?.message);
+      }
+    }
+
+    if (responses.length === 0) {
+      return res.status(500).json({ error: 'All response variants failed to generate' });
+    }
 
     // Generate quick reply for positive reviews
     var quickReply = null;
@@ -455,12 +630,20 @@ app.post('/generate', async function(req, res) {
       }
     }
 
+    // Increment server-side generation counter
+    var newCount = 0;
+    if (deviceId) {
+      newCount = await incrementGeneration(deviceId);
+    }
+
     res.json({
       responses: responses,
       quickReply: quickReply,
       variantLabels: (isPositive || isMixed)
         ? ['Short & Sweet', 'Detailed', hasSuggestion ? 'Proactive Fix' : 'Personal', 'Invite Back', (reviewerBadge || photoCount) ? 'Fan Love' : 'Our Story']
         : ['Option 1', 'Option 2', 'Option 3'],
+      generationCount: newCount,
+      generationsRemaining: isPro ? 999999 : Math.max(0, FREE_GENERATION_LIMIT - newCount),
     });
   } catch (error) {
     console.error('Error:', error.message);
