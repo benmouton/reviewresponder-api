@@ -9,7 +9,25 @@ var rateLimit = require('express-rate-limit');
 
 var app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+// ── Health check endpoint ───────────────────────────────────
+app.get('/health', async function(req, res) {
+  var dbOk = false;
+  try {
+    await pool.query('SELECT 1');
+    dbOk = true;
+  } catch (e) {
+    // db unreachable
+  }
+  var status = dbOk ? 200 : 503;
+  res.status(status).json({
+    status: dbOk ? 'ok' : 'degraded',
+    timestamp: new Date().toISOString(),
+    db: dbOk ? 'connected' : 'unreachable',
+    uptime: process.uptime(),
+  });
+});
 
 // Rate limiting: 30 requests per minute per IP for generation endpoints
 var generateLimiter = rateLimit({
@@ -22,8 +40,29 @@ var generateLimiter = rateLimit({
 app.use('/generate', generateLimiter);
 app.use('/ocr', generateLimiter);
 app.use('/analyze-review', generateLimiter);
+app.use('/check-limit', generateLimiter);
 
-var upload = multer({ dest: 'uploads/' });
+// Stricter rate limit for admin endpoint (10 per minute)
+var adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests.' },
+});
+app.use('/admin', adminLimiter);
+
+var upload = multer({
+  dest: 'uploads/',
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
+  fileFilter: function(req, file, cb) {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'));
+    }
+  },
+});
 
 var openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -41,8 +80,13 @@ async function initDatabase() {
       device_id TEXT NOT NULL,
       month TEXT NOT NULL,
       count INTEGER NOT NULL DEFAULT 0,
+      cost_micro_usd BIGINT NOT NULL DEFAULT 0,
       PRIMARY KEY (device_id, month)
     )
+  `);
+  // Add cost column to existing tables that were created without it
+  await pool.query(`
+    ALTER TABLE generations ADD COLUMN IF NOT EXISTS cost_micro_usd BIGINT NOT NULL DEFAULT 0
   `);
   console.log('[DB] Generations table ready');
 }
@@ -67,12 +111,26 @@ async function getGenerationCount(deviceId) {
   return result.rows.length > 0 ? result.rows[0].count : 0;
 }
 
-async function incrementGeneration(deviceId) {
+// Cost constants (micro-USD = millionths of a dollar) for gpt-4o-mini
+// $0.15/1M input tokens, $0.60/1M output tokens
+var GPT4O_MINI_INPUT_MICRO_USD_PER_TOKEN = 0.15;   // $0.15 per 1M = 0.15 micro-USD per token
+var GPT4O_MINI_OUTPUT_MICRO_USD_PER_TOKEN = 0.60;  // $0.60 per 1M = 0.60 micro-USD per token
+
+function calcCostMicroUsd(inputTokens, outputTokens) {
+  return Math.round(
+    (inputTokens * GPT4O_MINI_INPUT_MICRO_USD_PER_TOKEN) +
+    (outputTokens * GPT4O_MINI_OUTPUT_MICRO_USD_PER_TOKEN)
+  );
+}
+
+async function incrementGeneration(deviceId, costMicroUsd) {
   var month = getCurrentMonth();
   await pool.query(`
-    INSERT INTO generations (device_id, month, count) VALUES ($1, $2, 1)
-    ON CONFLICT (device_id, month) DO UPDATE SET count = generations.count + 1
-  `, [deviceId, month]);
+    INSERT INTO generations (device_id, month, count, cost_micro_usd) VALUES ($1, $2, 1, $3)
+    ON CONFLICT (device_id, month) DO UPDATE
+      SET count = generations.count + 1,
+          cost_micro_usd = generations.cost_micro_usd + $3
+  `, [deviceId, month, costMicroUsd || 0]);
   return await getGenerationCount(deviceId);
 }
 
@@ -585,7 +643,7 @@ app.post('/generate', async function(req, res) {
     var results = await Promise.allSettled(
       variantPrompts.map(function(prompt) {
         return openai.chat.completions.create({
-          model: 'gpt-4',
+          model: 'gpt-4o-mini',
           messages: [{ role: 'user', content: prompt }],
           max_tokens: 500,
           temperature: 0.85,
@@ -594,15 +652,21 @@ app.post('/generate', async function(req, res) {
     );
 
     var responses = [];
+    var totalInputTokens = 0;
+    var totalOutputTokens = 0;
     for (var i = 0; i < results.length; i++) {
       if (results[i].status === 'fulfilled') {
-        var text = results[i].value.choices[0].message.content;
+        var completion = results[i].value;
+        var text = completion.choices[0].message.content;
         text = ensureContactAndSignature(text, isNegative, hasContact, contactMethod, contactInfo, yourName, yourTitle, businessName);
         responses.push(text);
+        totalInputTokens += completion.usage ? completion.usage.prompt_tokens : 0;
+        totalOutputTokens += completion.usage ? completion.usage.completion_tokens : 0;
       } else {
         console.error('[generate] Variant ' + i + ' failed:', results[i].reason?.message);
       }
     }
+    var generationCostMicroUsd = calcCostMicroUsd(totalInputTokens, totalOutputTokens);
 
     if (responses.length === 0) {
       return res.status(500).json({ error: 'All response variants failed to generate' });
@@ -630,10 +694,10 @@ app.post('/generate', async function(req, res) {
       }
     }
 
-    // Increment server-side generation counter
+    // Increment server-side generation counter and log cost
     var newCount = 0;
     if (deviceId) {
-      newCount = await incrementGeneration(deviceId);
+      newCount = await incrementGeneration(deviceId, generationCostMicroUsd);
     }
 
     res.json({
@@ -651,7 +715,59 @@ app.post('/generate', async function(req, res) {
   }
 });
 
-var PORT = 3000;
+// Admin stats endpoint — secured by ADMIN_TOKEN env var
+app.get('/admin/stats', async function(req, res) {
+  var token = req.headers['x-admin-token'];
+  if (!token || token !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    var month = req.query.month || getCurrentMonth();
+    var stats = await pool.query(`
+      SELECT
+        COUNT(*) AS active_devices,
+        SUM(count) AS total_generations,
+        SUM(cost_micro_usd) AS total_cost_micro_usd,
+        AVG(count) AS avg_generations_per_device,
+        MAX(count) AS max_generations_device
+      FROM generations
+      WHERE month = $1
+    `, [month]);
+    var row = stats.rows[0];
+    var totalCostUsd = (parseInt(row.total_cost_micro_usd) || 0) / 1000000;
+    res.json({
+      month: month,
+      activeDevices: parseInt(row.active_devices) || 0,
+      totalGenerations: parseInt(row.total_generations) || 0,
+      avgGenerationsPerDevice: parseFloat(row.avg_generations_per_device) || 0,
+      maxGenerationsDevice: parseInt(row.max_generations_device) || 0,
+      totalCostUsd: totalCostUsd.toFixed(4),
+      estimatedCostPerGeneration: row.total_generations > 0
+        ? (totalCostUsd / parseInt(row.total_generations)).toFixed(6)
+        : '0.000000',
+    });
+  } catch (err) {
+    console.error('[admin/stats] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// ── Centralized error handler ────────────────────────────────
+app.use(function(err, req, res, next) {
+  if (err.message === 'Only image files are allowed' || err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ error: err.message || 'File too large (max 10MB)' });
+  }
+  console.error('[unhandled]', err.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+var PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
+  // Validate required env vars
+  var required = ['OPENAI_API_KEY', 'DATABASE_URL'];
+  var missing = required.filter(function(v) { return !process.env[v]; });
+  if (missing.length > 0) {
+    console.error('[STARTUP] Missing required env vars:', missing.join(', '));
+  }
   console.log(`Server running on http://0.0.0.0:${PORT}`);
 });
