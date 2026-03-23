@@ -362,6 +362,37 @@ function buildReviewerContext(reviewerName, reviewerBadge, photoCount, checkInCo
   return parts.join(' ');
 }
 
+// Helper: Platform-specific response style guidelines
+function buildPlatformStyleGuidelines(platform) {
+  if (!platform) return '';
+  var lower = platform.toLowerCase();
+  if (lower.indexOf('google') !== -1) {
+    return '\nPlatform-Specific Guidelines (Google):\n' +
+      '- Keep response concise (Google responses are most visible in search results)\n' +
+      '- Include the business name naturally (helps with local SEO)\n' +
+      '- Stay professional — Google reviews are highly visible to potential customers\n';
+  }
+  if (lower.indexOf('yelp') !== -1) {
+    return '\nPlatform-Specific Guidelines (Yelp):\n' +
+      '- Write a slightly longer, more detailed response (Yelp users expect engagement)\n' +
+      '- Acknowledge specific details from the review — Yelp reviewers put effort into their posts\n' +
+      '- Tone can be slightly more casual and conversational\n';
+  }
+  if (lower.indexOf('tripadvisor') !== -1 || lower.indexOf('trip advisor') !== -1) {
+    return '\nPlatform-Specific Guidelines (TripAdvisor):\n' +
+      '- Be warm and welcoming — TripAdvisor readers are often travelers planning visits\n' +
+      '- Reference the experience rather than just the food\n' +
+      '- Include a warm invitation to return\n';
+  }
+  if (lower.indexOf('facebook') !== -1) {
+    return '\nPlatform-Specific Guidelines (Facebook):\n' +
+      '- Keep it friendly and conversational — Facebook is a social platform\n' +
+      '- Response can be slightly more informal than other platforms\n' +
+      '- Short and warm works best\n';
+  }
+  return '';
+}
+
 // Helper: Detect subtle suggestions in positive reviews
 function detectSuggestions(reviewText) {
   var suggestionIndicators = [
@@ -507,6 +538,10 @@ app.post('/generate', async function(req, res) {
     basePrompt += '- Never blame the guest\n';
     basePrompt += '- Never mention photos, images, or visual content unless the review text itself explicitly references photos or images. Do not infer or assume photos exist based on reviewer badges or platform metadata.\n';
     basePrompt += '- Response must be ready to copy-paste as a public reply -- return ONLY the response text, no analysis, explanation, or headings\n\n';
+
+    // Platform-specific adjustments
+    var platformGuidelines = buildPlatformStyleGuidelines(platform);
+    if (platformGuidelines) basePrompt += platformGuidelines + '\n';
 
     // Rating-based strategy
     if (isPositive) {
