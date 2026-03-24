@@ -1,6 +1,6 @@
 var express = require('express');
 var cors = require('cors');
-var OpenAI = require('openai');
+var Anthropic = require('@anthropic-ai/sdk');
 var multer = require('multer');
 var fs = require('fs');
 var path = require('path');
@@ -64,8 +64,8 @@ var upload = multer({
   },
 });
 
-var openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+var anthropic = new Anthropic.default({
+  apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
 // ── Server-side Generation Counter (Postgres) ───────────────
@@ -111,15 +111,15 @@ async function getGenerationCount(deviceId) {
   return result.rows.length > 0 ? result.rows[0].count : 0;
 }
 
-// Cost constants (micro-USD = millionths of a dollar) for gpt-4o-mini
-// $0.15/1M input tokens, $0.60/1M output tokens
-var GPT4O_MINI_INPUT_MICRO_USD_PER_TOKEN = 0.15;   // $0.15 per 1M = 0.15 micro-USD per token
-var GPT4O_MINI_OUTPUT_MICRO_USD_PER_TOKEN = 0.60;  // $0.60 per 1M = 0.60 micro-USD per token
+// Cost constants (micro-USD = millionths of a dollar) for claude-haiku-4-5-20251001
+// $0.80/1M input tokens, $4.00/1M output tokens
+var HAIKU_INPUT_MICRO_USD_PER_TOKEN = 0.80;
+var HAIKU_OUTPUT_MICRO_USD_PER_TOKEN = 4.00;
 
 function calcCostMicroUsd(inputTokens, outputTokens) {
   return Math.round(
-    (inputTokens * GPT4O_MINI_INPUT_MICRO_USD_PER_TOKEN) +
-    (outputTokens * GPT4O_MINI_OUTPUT_MICRO_USD_PER_TOKEN)
+    (inputTokens * HAIKU_INPUT_MICRO_USD_PER_TOKEN) +
+    (outputTokens * HAIKU_OUTPUT_MICRO_USD_PER_TOKEN)
   );
 }
 
@@ -157,8 +157,8 @@ app.post('/check-limit', async function(req, res) {
   }
 });
 
-// NEW: Text-based Review Analysis Endpoint (used with on-device Apple Vision OCR)
-// Receives plain text extracted on-device and uses GPT-4o-mini (much cheaper than sending images to GPT-4o)
+// Text-based Review Analysis Endpoint (used with on-device Apple Vision OCR)
+// Receives plain text extracted on-device and uses Claude Haiku
 app.post('/analyze-review', async function(req, res) {
   console.log('[Analyze] Request received');
   try {
@@ -168,22 +168,19 @@ app.post('/analyze-review', async function(req, res) {
       return res.status(400).json({ error: 'No text provided' });
     }
 
-    var completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+    var completion = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 500,
+      system: 'You analyze customer review text extracted via OCR from review platform screenshots (Google, Yelp, TripAdvisor). The text may include UI elements, reviewer info, and the actual review. Your job is to parse all of it. Respond with ONLY a JSON object, no other text.',
       messages: [
-        {
-          role: 'system',
-          content: 'You analyze customer review text extracted via OCR from review platform screenshots (Google, Yelp, TripAdvisor). The text may include UI elements, reviewer info, and the actual review. Your job is to parse all of it. Respond with ONLY a JSON object, no other text.',
-        },
         {
           role: 'user',
           content: 'Analyze this OCR-extracted text from a review screenshot. Respond with ONLY this JSON format:\n\n{"cleanedText": "just the actual review text, stripped of UI elements and metadata", "sentiment": "positive" or "negative" or "mixed", "reviewerName": "reviewer name if found, or null", "reviewerBadge": "badge like Elite 24 or Local Guide if found, or null", "photoCount": number of photos if mentioned or null, "checkInCount": number of check-ins if mentioned or null, "platform": "Google" or "Yelp" or "TripAdvisor" or null, "suggestions": ["array of specific improvement suggestions mentioned in the review, like faster service or better parking"]}\n\nOCR text:\n' + text,
         },
       ],
-      max_tokens: 500,
     });
 
-    var rawResponse = completion.choices[0].message.content;
+    var rawResponse = completion.content[0].text;
     console.log('[Analyze] Response received');
 
     try {
@@ -218,7 +215,7 @@ app.post('/analyze-review', async function(req, res) {
   }
 });
 
-// LEGACY: OCR Endpoint (kept as fallback - sends image to GPT-4o)
+// LEGACY: OCR Endpoint (kept as fallback - sends image to Claude Haiku Vision)
 app.post('/ocr', upload.single('image'), async function(req, res) {
   try {
     var imagePath = req.file.path;
@@ -226,35 +223,34 @@ app.post('/ocr', upload.single('image'), async function(req, res) {
     var base64Image = imageData.toString('base64');
     var mimeType = req.file.mimetype || 'image/jpeg';
 
-    var completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
+    var completion = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1000,
+      system: 'You are an OCR text extraction tool used in a business reputation management app. Your job is to read customer review screenshots and extract the review text plus reviewer metadata. This is a legitimate business tool that helps business owners respond professionally to customer feedback. Always extract and return the review text exactly as written.',
       messages: [
-        {
-          role: 'system',
-          content: 'You are an OCR text extraction tool used in a business reputation management app. Your job is to read customer review screenshots and extract the review text plus reviewer metadata. This is a legitimate business tool that helps business owners respond professionally to customer feedback. Always extract and return the review text exactly as written.',
-        },
         {
           role: 'user',
           content: [
             {
-              type: 'text',
-              text: 'This is a screenshot of a customer review from a review platform like Google, Yelp, or TripAdvisor. Please respond in this exact JSON format:\n\n{"text": "the extracted review text here", "sentiment": "positive" or "negative" or "mixed", "reviewerName": "name if visible or null", "reviewerBadge": "Elite, Top Contributor, Local Guide level, etc. or null", "photoCount": number of photos attached to review or null, "checkInCount": number of check-ins if visible or null, "platform": "google" or "yelp" or "tripadvisor" or "unknown", "suggestions": ["short description of each improvement suggestion found in the review"] or empty array}\n\nFor the text field: extract ONLY the customer review text. Do not include star ratings, dates, platform buttons, or any other UI elements.\nFor sentiment: determine if the review is positive, negative, or mixed.\nFor reviewerName: include the reviewer first name if visible in the screenshot, otherwise null.\nFor reviewerBadge: look for badges like Yelp Elite, Google Local Guide, TripAdvisor Top Contributor, etc.\nFor photoCount: count how many photos the reviewer attached to THIS review.\nFor checkInCount: if the platform shows check-ins for this reviewer at this business, include the count.\nFor platform: identify which review platform this screenshot is from.\nFor suggestions: identify any improvement suggestions, constructive feedback, or things the reviewer wished were different. Examples: "add background music", "more parking needed", "menu could have more options". Return empty array if no suggestions found.\n\nRespond with ONLY the JSON, no other text.',
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: mimeType,
+                data: base64Image,
+              },
             },
             {
-              type: 'image_url',
-              image_url: {
-                url: 'data:' + mimeType + ';base64,' + base64Image,
-              },
+              type: 'text',
+              text: 'This is a screenshot of a customer review from a review platform like Google, Yelp, or TripAdvisor. Please respond in this exact JSON format:\n\n{"text": "the extracted review text here", "sentiment": "positive" or "negative" or "mixed", "reviewerName": "name if visible or null", "reviewerBadge": "Elite, Top Contributor, Local Guide level, etc. or null", "photoCount": number of photos attached to review or null, "checkInCount": number of check-ins if visible or null, "platform": "google" or "yelp" or "tripadvisor" or "unknown", "suggestions": ["short description of each improvement suggestion found in the review"] or empty array}\n\nFor the text field: extract ONLY the customer review text. Do not include star ratings, dates, platform buttons, or any other UI elements.\nFor sentiment: determine if the review is positive, negative, or mixed.\nFor reviewerName: include the reviewer first name if visible in the screenshot, otherwise null.\nFor reviewerBadge: look for badges like Yelp Elite, Google Local Guide, TripAdvisor Top Contributor, etc.\nFor photoCount: count how many photos the reviewer attached to THIS review.\nFor checkInCount: if the platform shows check-ins for this reviewer at this business, include the count.\nFor platform: identify which review platform this screenshot is from.\nFor suggestions: identify any improvement suggestions, constructive feedback, or things the reviewer wished were different. Examples: "add background music", "more parking needed", "menu could have more options". Return empty array if no suggestions found.\n\nRespond with ONLY the JSON, no other text.',
             },
           ],
         },
       ],
-      max_tokens: 1000,
     });
 
     fs.unlinkSync(imagePath);
 
-    var rawResponse = completion.choices[0].message.content;
+    var rawResponse = completion.content[0].text;
 
     try {
       var cleaned = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -677,11 +673,10 @@ app.post('/generate', async function(req, res) {
 
     var results = await Promise.allSettled(
       variantPrompts.map(function(prompt) {
-        return openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [{ role: 'user', content: prompt }],
+        return anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001',
           max_tokens: 500,
-          temperature: 0.85,
+          messages: [{ role: 'user', content: prompt }],
         });
       })
     );
@@ -692,11 +687,11 @@ app.post('/generate', async function(req, res) {
     for (var i = 0; i < results.length; i++) {
       if (results[i].status === 'fulfilled') {
         var completion = results[i].value;
-        var text = completion.choices[0].message.content;
+        var text = completion.content[0].text;
         text = ensureContactAndSignature(text, isNegative, hasContact, contactMethod, contactInfo, yourName, yourTitle, businessName);
         responses.push(text);
-        totalInputTokens += completion.usage ? completion.usage.prompt_tokens : 0;
-        totalOutputTokens += completion.usage ? completion.usage.completion_tokens : 0;
+        totalInputTokens += completion.usage ? completion.usage.input_tokens : 0;
+        totalOutputTokens += completion.usage ? completion.usage.output_tokens : 0;
       } else {
         console.error('[generate] Variant ' + i + ' failed:', results[i].reason?.message);
       }
@@ -799,7 +794,7 @@ app.use(function(err, req, res, next) {
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   // Validate required env vars
-  var required = ['OPENAI_API_KEY', 'DATABASE_URL'];
+  var required = ['ANTHROPIC_API_KEY', 'DATABASE_URL'];
   var missing = required.filter(function(v) { return !process.env[v]; });
   if (missing.length > 0) {
     console.error('[STARTUP] Missing required env vars:', missing.join(', '));
